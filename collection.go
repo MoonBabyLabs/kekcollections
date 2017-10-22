@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"log"
 	"github.com/rs/xid"
+	"strings"
+	"errors"
 )
 
 const COLLECTION_PATH = "c/"
+const SLUG_PATH = "slugs/"
 
 type Collection struct {
 	ResourceIds map[string]bool `json:"resource_ids"`
@@ -27,6 +30,9 @@ type Collection struct {
 	Docs map[string]kek.KekDoc `docs:"docs"`
 }
 
+var loadedCol chan *Collection
+var loadedChain chan bool
+
 func generateSlug(c *Collection) string {
 	var slug string
 
@@ -39,18 +45,17 @@ func generateSlug(c *Collection) string {
 		slug = rand
 	}
 
-	c.Slug = slug
+	c.Slug = strings.ToLower(slug)
 
 	return slug
 }
 
 
 func (c Collection) New() (Collection, error) {
+	blockString := make(chan string)
 	c.CreatedAt = time.Now()
 	c.UpdatedAt = time.Now()
-	ks := kek.Kekspace{}
-	kek.Load(kek.KEK_SPACE_CONFIG, &ks)
-	chain := revchain.Chain{}
+	c.Id = "cc" + xid.New().String()
 
 	for id, isIncluded := range c.ResourceIds {
 		if !isIncluded {
@@ -58,22 +63,70 @@ func (c Collection) New() (Collection, error) {
 		}
 	}
 
-	docIdBytes, _ := json.Marshal(c.ResourceIds)
-
-	blck := revchain.Block{}.New(ks, docIdBytes, "", 0)
-	chain = chain.New(blck)
-	c.Id = "cc" + xid.New().String()
-	c.Rev = blck.HashString()
+	go c.createChain(blockString)
+	c.Rev = <-blockString
 	generateSlug(&c)
-	kek.Save(COLLECTION_PATH + c.Id, c)
-	kek.Save(COLLECTION_PATH + "/" + c.Slug + "/" + c.Id, []byte{})
-	kek.Save(COLLECTION_PATH + c.Id + ".rev", chain)
+	slugSaved := make(chan bool)
+	go c.saveSlug(slugSaved)
+	cChan := make(chan bool)
+	go c.saveCol(cChan)
+	<- cChan
+	<- slugSaved
 
 	return c, nil
 }
 
+func (c Collection) createChain(blockString chan string) {
+	revSaved := make(chan bool)
+	ks := kek.Kekspace{}
+	chain := revchain.Chain{}
+	kek.Load(kek.KEK_SPACE_CONFIG, &ks)
+	docIdBytes, _ := json.Marshal(c.ResourceIds)
+	blck := revchain.Block{}.New(ks, docIdBytes, "", 0)
+	chain = chain.New(blck)
+	go c.saveRev(chain, revSaved)
+	<-revSaved
+	blockString <- blck.HashString()
+}
+
+
+func (c Collection) saveRev(chain revchain.Chain, revChan chan bool) {
+	
+	kek.Save(COLLECTION_PATH + c.Id + ".kek", chain)
+	
+	revChan <- true
+	
+}
+
+func (c Collection) saveCol(colChan chan bool) {
+	kek.Save(COLLECTION_PATH + c.Id, c)
+	colChan <- true
+}
+
+func (c Collection) loadKekspace(ks chan kek.Kekspace) kek.Kekspace {
+	kekSp := kek.Kekspace{}
+	sp, _ := kek.Load(kek.KEK_SPACE_CONFIG, kekSp)
+	ks <- sp.(kek.Kekspace)
+
+	return sp.(kek.Kekspace)
+}
+
+func (c Collection) loadChain(chain *revchain.Chain) {
+	kek.Load(COLLECTION_PATH + c.Id + ".kek", &chain)
+	loadedChain <- true
+}
+
+func (c *Collection) saveSlug(slugSaved chan bool) {
+	kek.Save(SLUG_PATH + "/" + c.Slug + "/" + c.Id, []byte{})
+	slugSaved <- true
+}
+
 func (c Collection) LoadById(id string, withDocs, withRevisions bool) (Collection, error) {
-	kek.Load(COLLECTION_PATH + id, &c)
+	_, err := kek.Load(COLLECTION_PATH + id, &c)
+
+	if err != nil {
+		return c, err
+	}
 
 	if withDocs {
 		c.Docs = make(map[string]kek.KekDoc)
@@ -87,14 +140,14 @@ func (c Collection) LoadById(id string, withDocs, withRevisions bool) (Collectio
 
 	if withRevisions {
 		revisions := revchain.Chain{}
-		kek.Load(COLLECTION_PATH + id + ".rev", &revisions)
+		kek.Load(COLLECTION_PATH + id + ".kek", &revisions)
 	}
 
 	return c, nil
 }
 
 func (c Collection) LoadBySlug(slug string, collectionItem int, withDocs, withRevisions bool) (Collection, error) {
-	collectionIds, err := kek.List(COLLECTION_PATH + slug, -1)
+	collectionIds, err := kek.List(SLUG_PATH + slug, -1)
 	count := 0
 
 	if err != nil {
@@ -123,53 +176,106 @@ func (c Collection) LoadBySlug(slug string, collectionItem int, withDocs, withRe
 
 	if withRevisions {
 		revisions := revchain.Chain{}
-		kek.Load(COLLECTION_PATH + c.Id + ".rev", &revisions)
+		kek.Load(COLLECTION_PATH + c.Id + ".kek", &revisions)
 	}
 
 	return c, nil
 }
 
 func (c *Collection) Delete(delRev bool) (error) {
-	kek.Delete(COLLECTION_PATH + c.Id)
+	delDone := make(chan error, 3)
+	col, _ := c.LoadById(c.Id, false, false)
+
+	go func() {
+		delDone <- kek.Delete(COLLECTION_PATH + col.Id)
+	}()
 
 	if delRev {
-		kek.Delete(COLLECTION_PATH + c.Id + ".rev")
+		go func() {
+			delDone <- kek.Delete(COLLECTION_PATH + col.Id + ".kek")
+		}()
+	} else {
+		delDone <- nil
 	}
 
-	return kek.Delete(COLLECTION_PATH + "/" + c.Slug + "/" + c.Id)
+	go func() {
+		delDone <- kek.Delete(COLLECTION_PATH + col.Slug + "/" + col.Id)
+	}()
+
+	for i := 0; i < 3; i++ {
+		select {
+		case delErr := <-delDone:
+			if delErr != nil {
+				return delErr
+			}
+		}
+	}
+
+	return nil
 }
 
 func (c *Collection) Replace() (*Collection, error) {
-	oldCol := Collection{}
-	kek.Load(c.Id, &oldCol)
-	oldCol.Delete(false)
-	rev, revErr := c.AddRevision()
+	revUpdate := make(chan string)
+	saveCol := make(chan bool)
+	go c.AddRevision(revUpdate)
 	c.UpdatedAt = time.Now()
 	c.Slug = generateSlug(c)
-	c.Rev = rev
+	c.Rev =  <-revUpdate
+	go c.saveCol(saveCol)
+	<-saveCol
 
-	if revErr != nil {
-		return c, revErr
-	}
-
-	return c, kek.Save(COLLECTION_PATH + c.Id, c)
+	return c, nil
 }
 
-func (c *Collection) Patch(newCol Collection) (*Collection, error) {
+func (c Collection) All(withDocs bool, withKek bool) (map[string]Collection, error) {
+	cols := make(map[string]Collection)
+
+	contents, loadErr := kek.List(COLLECTION_PATH, -1)
+
+	if loadErr != nil {
+		return cols, loadErr
+	}
+
+	for item, _ := range contents {
+		colIdChars := item[0:2]
+		if colIdChars == "cc" && !strings.Contains(item, ".kek") {
+			cCol, colLoadEr := c.LoadById(item, withDocs, withKek)
+
+			if colLoadEr != nil {
+				return cols, colLoadEr
+			}
+
+			cols[item] = cCol
+		}
+	}
+
+	return cols, nil
+}
+
+func (c Collection) loadCol(col *Collection) {
+	kek.Load(c.Id, &col)
+	loadedCol <- col
+}
+
+func (c *Collection) Merge(oldColChan chan Collection) {
 	oldCol := Collection{}
 	kek.Load(COLLECTION_PATH + c.Id, &oldCol)
-	oldCol.UpdatedAt = time.Now()
-
+	log.Print(c)
+	log.Print(oldCol)
 	if c.Name != "" && c.Name != oldCol.Name {
 		oldCol.Name = c.Name
 	}
 
+	
 	if c.Slug != "" && c.Slug != oldCol.Slug {
 		oldCol.Slug = c.Slug
 	} else if c.Slug == "" && oldCol.Slug == "" {
 		oldCol.Slug = generateSlug(c)
 	}
 
+	if oldCol.ResourceIds == nil {
+		oldCol.ResourceIds = make(map[string]bool)
+	}
 	for docKey, include := range c.ResourceIds {
 		if include {
 			oldCol.ResourceIds[docKey] = true
@@ -183,39 +289,46 @@ func (c *Collection) Patch(newCol Collection) (*Collection, error) {
 		oldCol.Description = c.Description
 	}
 
+	oldColChan <- oldCol
+}
 
-	rev, revErr :=  oldCol.AddRevision()
-
-	if revErr != nil {
-		return c, revErr
-	}
-
-	c.Rev = rev
-
-
-	kek.Save(COLLECTION_PATH + oldCol.Id, oldCol)
+func (c *Collection) Patch() (*Collection, error) {
+	oldColChan := make( chan Collection)
+	go c.Merge(oldColChan)
+	oldCol := <-oldColChan
+	oldCol.UpdatedAt = time.Now()
+	revString := make(chan string)
+	go oldCol.AddRevision(revString)
+	oldCol.Rev = <- revString
+	colSaved := make(chan bool)
+	go oldCol.saveCol(colSaved)
+	<-colSaved
 
 	return c, nil
 }
 
-func (c *Collection) AddRevision() (string, error) {
+func (c *Collection) AddRevision(revDone chan string) (string, error) {
 	chain := revchain.Chain{}
 	ks := kek.Kekspace{}
 	_, ksErr := kek.Load(kek.KEK_SPACE_CONFIG, &ks)
-
+	
 	if ksErr != nil {
 		return "", ksErr
 	}
-	_, err := kek.Load(COLLECTION_PATH + c.Id + ".rev", &chain)
+	
+	_, err := kek.Load(COLLECTION_PATH + c.Id + ".kek", &chain)
 
 	if err != nil {
 		return "", err
 	}
-
+	
 	lastBlock := chain.GetLast()
 	block := revchain.Block{}.New(ks, c, lastBlock.HashString(), lastBlock.Index + 1)
 	chain.AddBlock(block)
-	kek.Save(COLLECTION_PATH + c.Id + ".rev", chain)
+	saveRev := make(chan bool)
+	go c.saveRev(chain, saveRev)
+	<-saveRev
+	revDone <- block.HashString()
 
 	return block.HashString(), nil
 }
@@ -224,37 +337,48 @@ func (c Collection) Save() error {
 	return kek.Save(COLLECTION_PATH + c.Id, c)
 }
 
-func (c Collection) AddDoc(kd kek.KekDoc) (Collection, error) {
+func (c *Collection) AddDoc(kd kek.KekDoc) (*Collection, error) {
 	c.UpdatedAt = time.Now()
+
+	if len(c.ResourceIds) == 0 {
+		c.ResourceIds = map[string]bool{}
+	}
+
 	c.ResourceIds[kd.Id] = true
 	chain := revchain.Chain{}
 	block := revchain.Block{}
-	ks := kek.Kekspace{}
-	kek.Load(COLLECTION_PATH + c.Id + ".rev", &chain)
-	kek.Load(kek.KEK_SPACE_CONFIG, &ks)
+	ks, _ := kek.Kekspace{}.Load()
+	kek.Load(COLLECTION_PATH + c.Id + ".kek", &chain)
 	lastBlock := chain.GetLast()
 	docBytes, _ := json.Marshal(c.ResourceIds)
 	newBlock := block.New(ks, docBytes, lastBlock.HashString(), lastBlock.Index)
 	chain.AddBlock(newBlock)
-	c.Rev = chain.GetLast().HashString()
+	c.Rev = newBlock.HashString()
 	kek.Save(COLLECTION_PATH + c.Id, c)
-	kek.Save(COLLECTION_PATH + c.Id + ".rev", chain)
+	kek.Save(COLLECTION_PATH + c.Id + ".kek", chain)
 
 	return c, nil
 }
 
-func (c Collection) DeleteDoc(kd kek.KekDoc) (Collection, error) {
+
+func (c *Collection) DeleteDoc(kd kek.KekDoc) (*Collection, error) {
+
+	if len(c.ResourceIds) < 1 || !c.ResourceIds[kd.Id] {
+		return c, errors.New("Cannot remove kekdoc: " + kd.Id + " because it already isn't an association.")
+	}
+
 	c.UpdatedAt = time.Now()
 	chain := revchain.Chain{}
 	block := revchain.Block{}
-	ks := kek.Kekspace{}
-	kek.Load(COLLECTION_PATH + c.Id + ".rev", &chain)
-	kek.Load(kek.KEK_SPACE_CONFIG, &ks)
+	ks, _ := kek.Kekspace{}.Load()
+	kek.Load(COLLECTION_PATH + c.Id + ".kek", &chain)
 	lastBlock := chain.GetLast()
-	newBlock := block.New(ks, []byte(kd.Id), lastBlock.HashString(), lastBlock.Index)
+	docBytes, _ := json.Marshal(c.ResourceIds)
+	newBlock := block.New(ks, docBytes, lastBlock.HashString(), lastBlock.Index)
 	chain.AddBlock(newBlock)
 	delete(c.ResourceIds, kd.Id)
-	kek.Save(COLLECTION_PATH + c.Id + ".rev", chain)
+	c.Rev = newBlock.HashString()
+	kek.Save(COLLECTION_PATH + c.Id + ".kek", chain)
 	kek.Save(COLLECTION_PATH + c.Id, c)
 
 	return c, nil
