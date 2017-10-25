@@ -10,6 +10,7 @@ import (
 	"github.com/rs/xid"
 	"strings"
 	"errors"
+	"strconv"
 )
 
 const COLLECTION_PATH = "c/"
@@ -57,6 +58,18 @@ func generateSlug(c *Collection) string {
 	}
 
 	c.Slug = strings.ToLower(slug)
+	doesntExist := false
+	baseSlug := c.Slug
+
+	for doesntExist {
+		_, empty := c.store.List(COLLECTION_PATH + c.Slug)
+		if empty != nil {
+			doesntExist = true
+			continue
+		}
+		rand, _ := csrf.RandomString(3)
+		c.Slug = baseSlug + "-" + rand
+	}
 
 	return slug
 }
