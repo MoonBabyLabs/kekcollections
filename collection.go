@@ -3,43 +3,46 @@ package kekcollections
 import (
 	"github.com/MoonBabyLabs/kek"
 	"time"
-	"github.com/MoonBabyLabs/revchain"
 	"github.com/metal3d/go-slugify"
 	"github.com/revel/modules/csrf/app"
-	"encoding/json"
 	"github.com/rs/xid"
 	"strings"
 	"errors"
-	"strconv"
+	"github.com/MoonBabyLabs/revchain"
+	"github.com/MoonBabyLabs/kekstore"
+	"log"
+	"os"
 )
 
 const COLLECTION_PATH = "c/"
 const SLUG_PATH = "slugs/"
 
 type Collection struct {
-	store kek.Storer
+	store kekstore.Storer
 	ResourceIds map[string]bool `json:"resource_ids"`
 	Slug string `json:"slug"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Id string `json:"id"`
-	KekId string `json:"kekid"`
 	Name string `json:"name"`
 	Description string `json:"description"`
-	Revisions revchain.Chain `json:"revisions"`
+	Revisions revchain.ChainMaker `json:"revisions"`
 	Rev string `json:"rev"`
 	Docs map[string]kek.Doc `json:"docs"`
 	Collections map[string]Collection `json:"collections"`
 }
 
 var loadedCol chan *Collection
-var loadedChain chan bool
 
-func (c Collection) Store() kek.Storer {
+// Store returns back the collection store location.
+func (c Collection) Store() kekstore.Storer {
 	return c.store
 }
 
-func (c Collection) SetStore(store kek.Storer) Collection {
+// SetStore sets the location for which to store the collections.
+// By default, Collections will use the kekstore.Store which stores content in the ~/.kek directory.
+// You probably should avoid setting the store unless you are testing or are positive you want to change the location that you are storing your kek collections.
+func (c Collection) SetStore(store kekstore.Storer) Collection {
 	c.store = store
 
 	return c
@@ -59,26 +62,46 @@ func generateSlug(c *Collection) string {
 
 	c.Slug = strings.ToLower(slug)
 	doesntExist := false
-	baseSlug := c.Slug
+	log.Print(slug)
 
-	for doesntExist {
-		_, empty := c.store.List(COLLECTION_PATH + c.Slug)
-		if empty != nil {
+	for !doesntExist {
+		items, _ := c.store.List(SLUG_PATH + c.Slug)
+
+		if len(items) == 0 {
 			doesntExist = true
 			continue
 		}
 		rand, _ := csrf.RandomString(3)
-		c.Slug = baseSlug + "-" + rand
+		c.Slug = slug + "-" + rand
 	}
 
 	return slug
 }
 
-func (c Collection) New() error {
-	blockString := make(chan string)
+// New generates and stores a new Collection item based on the current store location.
+// You can optionally specify the initial name, description and resourceIds or just leave zero values.
+// It will create the remaining properties of CreatedAt, UpdatedAt, Id, Slug, Revision & Revisions. You shouldn't ever set these values.
+func (c Collection) New(name, description string, resourceIds map[string]bool) (Collection, error) {
+	if c.store == nil {
+		c.store = kekstore.Store{}
+	}
+
+	c.Name = name
+	c.Description = description
+	c.ResourceIds = resourceIds
 	c.CreatedAt = time.Now()
 	c.UpdatedAt = time.Now()
 	c.Id = "cc" + xid.New().String()
+
+	if c.Revisions == nil {
+		chain, cErr := revchain.Chain{}.New(c.Id, c)
+
+		if cErr != nil {
+			return c, cErr
+		}
+
+		c.Rev = chain.GetHashString()
+	}
 
 	for id, isIncluded := range c.ResourceIds {
 		if !isIncluded {
@@ -86,62 +109,20 @@ func (c Collection) New() error {
 		}
 	}
 
-	c.createChain(blockString)
-	c.Rev = <-blockString
 	generateSlug(&c)
 	c.saveSlug()
 
-	return c.store.Save(COLLECTION_PATH + c.Id, c)
+	return c, c.store.Save(COLLECTION_PATH + c.Id, c)
 }
 
-func (c Collection) createChain(blockString chan string) error {
-	revSaved := make(chan bool)
-	ks, ksErr := kek.Kekspace{}.Load()
-
-	if ksErr != nil {
-		return ksErr
-	}
-
-	chain := revchain.Chain{}
-	docIdBytes, _ := json.Marshal(c.ResourceIds)
-	blck := revchain.Block{}.New(ks, docIdBytes, "", 0)
-	chain = chain.New(blck)
-	go c.saveRev(chain, revSaved)
-	<-revSaved
-	blockString <- blck.HashString()
-
-	return nil
-}
-
-func (c Collection) saveRev(chain revchain.Chain, revChan chan bool) {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
-	c.store.Save(COLLECTION_PATH + c.Id + ".kek", chain)
-	revChan <- true
-}
-
-func (c Collection) loadChain(chain *revchain.Chain) {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
-	c.store.Load(COLLECTION_PATH + c.Id + ".kek", &chain)
-	loadedChain <- true
-}
 
 func (c *Collection) saveSlug() error {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
 	return c.store.Save(SLUG_PATH + "/" + c.Slug + "/" + c.Id, []byte{})
 }
 
 func (c Collection) LoadById(id string, withResources, withRevisions bool) (Collection, error) {
 	if c.store == nil {
-		c.store = kek.Store{}
+		c.store = kekstore.Store{}
 	}
 
 	err := c.store.Load(COLLECTION_PATH + id, &c)
@@ -173,8 +154,23 @@ func (c Collection) LoadById(id string, withResources, withRevisions bool) (Coll
 	}
 
 	if withRevisions {
-		revisions := revchain.Chain{}
-		c.store.Load(COLLECTION_PATH + id + ".kek", &revisions)
+		if c.Revisions == nil {
+			revisions, revErr := revchain.Chain{}.SetStore(c.Store()).Load(c.Id)
+
+			if revErr != nil {
+				return c, revErr
+			}
+
+			c.Revisions = revisions
+		} else {
+			loadedRev, revErr := c.Revisions.Load(c.Id)
+
+			if revErr != nil {
+				return c, revErr
+			}
+
+			c.Revisions = loadedRev
+		}
 	}
 
 	return c, nil
@@ -182,7 +178,7 @@ func (c Collection) LoadById(id string, withResources, withRevisions bool) (Coll
 
 func (c Collection) LoadBySlug(slug string, withResources, withKek bool) (Collection, error) {
 	if c.store == nil {
-		c.store = kek.Store{}
+		c.store = kekstore.Store{}
 	}
 
 	collectionIds, err := c.store.List(SLUG_PATH + slug)
@@ -195,10 +191,11 @@ func (c Collection) LoadBySlug(slug string, withResources, withKek bool) (Collec
 	earliestColId := ""
 
 	for id := range collectionIds {
-		la, err := xid.FromString(id)
+		xResourceId := id[2:]
+		la, err := xid.FromString(xResourceId)
 
 		if err != nil {
-			continue
+			return c, err
 		}
 
 		if la.Time().Unix() < earliestWhen.Unix() {
@@ -209,10 +206,11 @@ func (c Collection) LoadBySlug(slug string, withResources, withKek bool) (Collec
 	return c.LoadById(earliestColId, withResources, withKek)
 }
 
-func (c *Collection) Delete(delRev bool) (error) {
+func (c Collection) Delete(delRev bool) (error) {
 	if c.store == nil {
-		c.store = kek.Store{}
+		c.store = kekstore.Store{}
 	}
+
 
 	delDone := make(chan error, 3)
 	col, _ := c.LoadById(c.Id, false, false)
@@ -223,14 +221,17 @@ func (c *Collection) Delete(delRev bool) (error) {
 
 	if delRev {
 		go func() {
-			delDone <- c.store.Delete(COLLECTION_PATH + col.Id + ".kek")
+			if c.Revisions == nil {
+				c.Revisions = revchain.Chain{}.SetStore(c.Store())
+			}
+			delDone <- c.Revisions.Delete(col.Id)
 		}()
 	} else {
 		delDone <- nil
 	}
 
 	go func() {
-		delDone <- c.store.Delete(COLLECTION_PATH + col.Slug + "/" + col.Id)
+		delDone <- os.RemoveAll(SLUG_PATH + col.Slug)
 	}()
 
 	for i := 0; i < 3; i++ {
@@ -245,19 +246,9 @@ func (c *Collection) Delete(delRev bool) (error) {
 	return nil
 }
 
-func (c *Collection) Replace() error {
-	revUpdate := make(chan string)
-	go c.AddRevision(revUpdate)
-	c.UpdatedAt = time.Now()
-	c.Slug = generateSlug(c)
-	c.Rev =  <-revUpdate
-
-	return c.Save()
-}
-
 func (c Collection) All(withDocs bool, withKek bool) (map[string]Collection, error) {
 	if c.store == nil {
-		c.store = kek.Store{}
+		c.store = kekstore.Store{}
 	}
 
 	cols := make(map[string]Collection)
@@ -285,131 +276,67 @@ func (c Collection) All(withDocs bool, withKek bool) (map[string]Collection, err
 
 func (c Collection) loadCol(col *Collection) {
 	if c.store == nil {
-		c.store = kek.Store{}
+		c.store = kekstore.Store{}
 	}
 
 	c.store.Load(c.Id, &col)
 	loadedCol <- col
 }
 
-func (c *Collection) Merge(oldColChan chan Collection) {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
-	oldCol := Collection{}
-	c.store.Load(COLLECTION_PATH + c.Id, &oldCol)
-
-	if c.Name != "" && c.Name != oldCol.Name {
-		oldCol.Name = c.Name
-	}
-	
-	if c.Slug != "" && c.Slug != oldCol.Slug {
-		oldCol.Slug = c.Slug
-	} else if c.Slug == "" && oldCol.Slug == "" {
-		oldCol.Slug = generateSlug(c)
-	}
-
-	if oldCol.ResourceIds == nil {
-		oldCol.ResourceIds = make(map[string]bool)
-	}
-
-	for docKey, include := range c.ResourceIds {
-		if include {
-			oldCol.ResourceIds[docKey] = true
-		} else {
-			delete(oldCol.ResourceIds, docKey)
-		}
-	}
-
-	if c.Description != "" {
-		oldCol.Description = c.Description
-	}
-
-	oldColChan <- oldCol
-}
-
-func (c *Collection) Patch() error {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
-	oldColChan := make( chan Collection)
-	c.Merge(oldColChan)
-
-	return c.Save()
-}
-
-func (c *Collection) AddRevision(revDone chan string) (string, error) {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
-	chain := revchain.Chain{}
-	ks := kek.Kekspace{}
-	ksErr := c.store.Load(kek.KEK_SPACE_CONFIG, &ks)
-	
-	if ksErr != nil {
-		return "", ksErr
-	}
-	
-	err := c.store.Load(COLLECTION_PATH + c.Id + ".kek", &chain)
-
-	if err != nil {
-		return "", err
-	}
-	
-	lastBlock := chain.GetLast()
-	block := revchain.Block{}.New(ks, c, lastBlock.HashString(), lastBlock.Index + 1)
-	chain.AddBlock(block)
-	saveRev := make(chan bool)
-	c.saveRev(chain, saveRev)
-	revDone <- block.HashString()
-
-	return block.HashString(), nil
-}
-
 func (c Collection) Save() error {
 	if c.store == nil {
-		c.store = kek.Store{}
+		c.store = kekstore.Store{}
+	}
+
+	if c.Revisions == nil {
+		revLoad, revLoadErr := revchain.Chain{}.Load(c.Id)
+		if revLoadErr != nil {
+			return revLoadErr
+		}
+
+		addedBlock, addRevErr := revLoad.AddBlock(c.Id, c)
+
+		if addRevErr != nil {
+			return addRevErr
+		}
+
+		c.Rev = addedBlock.GetHashString()
+	} else{
+		revLoad, revLoadErr := c.Revisions.Load(c.Id)
+		if revLoadErr != nil {
+			return revLoadErr
+		}
+
+		addedBlock, addRevErr := revLoad.AddBlock(c.Id, c)
+
+		if addRevErr != nil {
+			return addRevErr
+		}
+
+		c.Rev = addedBlock.GetHashString()
 	}
 
 	c.UpdatedAt = time.Now()
-	revDone := make(chan string)
-	latestRev, err := c.AddRevision(revDone)
-
-	if err != nil {
-		return err
-	}
-
-	c.Rev = latestRev
 
 	return c.store.Save(COLLECTION_PATH + c.Id, c)
 }
 
-func (c *Collection) AddDoc(kd kek.Doc) error {
-	if c.store == nil {
-		c.store = kek.Store{}
-	}
-
+func (c *Collection) AddResource(resourceId string) error {
 	if len(c.ResourceIds) == 0 {
 		c.ResourceIds = map[string]bool{}
 	}
 
-	c.ResourceIds[kd.Id] = true
+	c.ResourceIds[resourceId] = true
 
 	return c.Save()
 }
 
-
-func (c *Collection) DeleteDoc(kd kek.Doc) error {
-	if c.store == nil {
-		c.store = kek.Store{}
+func (c *Collection) DeleteResource(resourceId string) error {
+	if len(c.ResourceIds) < 1 || !c.ResourceIds[resourceId] {
+		return errors.New("Cannot remove kekresource: " + resourceId + " because an association doesn't currently exist")
 	}
 
-	if len(c.ResourceIds) < 1 || !c.ResourceIds[kd.Id] {
-		return errors.New("Cannot remove kekresource: " + kd.Id + " because an association doesn't currently exist")
-	}
+	delete(c.ResourceIds, resourceId)
 
 	return c.Save()
 }
