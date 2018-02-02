@@ -94,7 +94,13 @@ func (c Collection) New(name, description string, resourceIds map[string]bool) (
 	c.Id = "cc" + xid.New().String()
 
 	if c.Revisions == nil {
-		chain, cErr := revchain.Chain{}.New(c.Id, c)
+		new := map[string]interface{}{
+			"name" : c.Name,
+			"description" : c.Description,
+			"resource_ids" : c.ResourceIds,
+			"slug" : c.Slug,
+		}
+		chain, cErr := revchain.Chain{}.New(c.Id, new)
 
 		if cErr != nil {
 			return c, cErr
@@ -147,7 +153,11 @@ func (c Collection) LoadById(id string, withResources, withRevisions bool) (Coll
 			case "dd":
 				kd := kek.Doc{}
 				c.store.Load(kek.DOC_DIR + resourceId, &kd)
-				c.Docs[resourceId] = kd
+
+				if kd.Id != "" {
+					c.Docs[resourceId] = kd
+				}
+
 				break
 			}
 		}
@@ -274,6 +284,39 @@ func (c Collection) All(withDocs bool, withKek bool) (map[string]Collection, err
 	return cols, nil
 }
 
+func getMods(c *Collection) (map[string]interface{}, map[string]interface{}, map[string]interface{}) {
+	old, _ := Collection{}.LoadById(c.Id, false, false)
+	newMod := map[string]interface{}{}
+	modMod := map[string]interface{}{}
+	deletedMod := map[string]interface{}{}
+
+	if old.Name != c.Name {
+		modMod["name"] = c.Name
+	}
+
+	if old.Description != c.Description {
+		modMod["description"] = c.Description
+	}
+
+	if old.Slug != c.Slug {
+		modMod["slug"] = c.Slug
+	}
+
+	for k, _ := range old.ResourceIds {
+		if !c.ResourceIds[k] {
+			deletedMod[k] = false
+		}
+	}
+
+	for k, _ := range c.ResourceIds {
+		if !old.ResourceIds[k] {
+			newMod[k] = true
+		}
+	}
+
+	return newMod, modMod, deletedMod
+}
+
 func (c Collection) loadCol(col *Collection) {
 	if c.store == nil {
 		c.store = kekstore.Store{}
@@ -288,13 +331,16 @@ func (c Collection) Save() error {
 		c.store = kekstore.Store{}
 	}
 
+	newMod, mod, old := getMods(&c)
+
 	if c.Revisions == nil {
 		revLoad, revLoadErr := revchain.Chain{}.Load(c.Id)
 		if revLoadErr != nil {
 			return revLoadErr
 		}
 
-		addedBlock, addRevErr := revLoad.AddBlock(c.Id, c)
+
+		addedBlock, addRevErr := revLoad.AddBlock(c.Id, newMod, mod, old)
 
 		if addRevErr != nil {
 			return addRevErr
@@ -307,7 +353,7 @@ func (c Collection) Save() error {
 			return revLoadErr
 		}
 
-		addedBlock, addRevErr := revLoad.AddBlock(c.Id, c)
+		addedBlock, addRevErr := revLoad.AddBlock(c.Id, newMod, mod, old)
 
 		if addRevErr != nil {
 			return addRevErr
@@ -326,6 +372,17 @@ func (c *Collection) AddResource(resourceId string) error {
 		c.ResourceIds = map[string]bool{}
 	}
 
+	resType := resourceId[0:2]
+
+	if resType == "dd" {
+		doc, _ := kek.Doc{}.Get(resourceId, false)
+		doc.CollectionIds[c.Id] = true
+
+		if err := doc.SaveCollectionIds(); err != nil {
+			return err
+		}
+	}
+
 	c.ResourceIds[resourceId] = true
 
 	return c.Save()
@@ -334,6 +391,16 @@ func (c *Collection) AddResource(resourceId string) error {
 func (c *Collection) DeleteResource(resourceId string) error {
 	if len(c.ResourceIds) < 1 || !c.ResourceIds[resourceId] {
 		return errors.New("Cannot remove kekresource: " + resourceId + " because an association doesn't currently exist")
+	}
+	resType := resourceId[0:2]
+
+	if resType == "dd" {
+		doc, _ := kek.Doc{}.Get(resourceId, false)
+		delete(doc.CollectionIds, c.Id)
+
+		if err := doc.SaveCollectionIds(); err != nil {
+			return err
+		}
 	}
 
 	delete(c.ResourceIds, resourceId)
